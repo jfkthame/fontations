@@ -199,6 +199,14 @@ impl<'a> CoverageTable<'a> {
             CoverageTable::Format2(sub) => sub.intersect_set(glyphs),
         }
     }
+
+    /// Return the number of glyphs in this table
+    pub fn population(&self) -> usize {
+        match self {
+            CoverageTable::Format1(sub) => sub.population(),
+            CoverageTable::Format2(sub) => sub.population(),
+        }
+    }
 }
 
 impl CoverageFormat1<'_> {

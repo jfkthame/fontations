@@ -3,6 +3,8 @@
 //! This means taking a set of glyphs and updating it to include any other glyphs
 //! reachable from those glyphs via substitution, recursively.
 
+use core::u16;
+
 use font_types::{GlyphId, GlyphId16};
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::tables::layout::{
 mod ctx {
     use std::collections::HashMap;
 
-    use types::GlyphId16;
+    use types::{GlyphId, GlyphId16};
 
     use crate::{collections::IntSet, tables::gsub::SubstitutionLookup};
 
@@ -37,7 +39,7 @@ mod ctx {
 
     pub(super) struct ClosureCtx<'a> {
         /// the current closure glyphs. This is updated as we go.
-        glyphs: &'a mut IntSet<GlyphId16>,
+        glyphs: &'a mut IntSet<GlyphId>,
         // in certain situations (like when recursing into contextual lookups) we
         // consider a smaller subset of glyphs to be 'active'.
         cur_glyphs: Option<IntSet<GlyphId16>>,
@@ -49,28 +51,49 @@ mod ctx {
         // here we store tuples of (LookupId, relevant glyphs); these todos can
         // be done at the end of each pass.
         contextual_lookup_todos: Vec<super::ContextualLookupRef>,
+
+        active_glyphs_stack: Vec<IntSet<GlyphId>>,
+        output: IntSet<GlyphId>,
     }
 
     impl<'a> ClosureCtx<'a> {
-        pub(super) fn new(glyphs: &'a mut IntSet<GlyphId16>) -> Self {
+        pub(super) fn new(glyphs: &'a mut IntSet<GlyphId>) -> Self {
             Self {
                 glyphs,
                 cur_glyphs: Default::default(),
                 contextual_lookup_todos: Default::default(),
                 finished_lookups: Default::default(),
+                active_glyphs_stack: Vec::new(),
+                output: IntSet::empty(),
             }
+        }
+
+        pub(super) fn parent_active_glyphs(&self) -> &IntSet<GlyphId> {
+            if self.active_glyphs_stack.is_empty() {
+                return &*self.glyphs;
+            }
+
+            self.active_glyphs_stack.last().unwrap()
         }
 
         pub(super) fn current_glyphs(&self) -> &IntSet<GlyphId16> {
             self.cur_glyphs.as_ref().unwrap_or(self.glyphs)
         }
 
-        pub(super) fn glyphs(&self) -> &IntSet<GlyphId16> {
+        pub(super) fn glyphs(&self) -> &IntSet<GlyphId> {
             self.glyphs
         }
 
         pub(super) fn add_glyph(&mut self, gid: GlyphId16) {
             self.glyphs.insert(gid);
+        }
+
+        pub(super) fn add(&mut self, gid: GlyphId) {
+            self.output.insert(gid);
+        }
+
+        pub(super) fn add_glyph_set(&mut self, iter: impl IntoIterator<Item = GlyphId>) {
+            self.output.extend(iter)
         }
 
         pub(super) fn extend_glyphs(&mut self, iter: impl IntoIterator<Item = GlyphId16>) {
@@ -282,63 +305,119 @@ impl<'a, T: FontRead<'a> + GlyphClosure + 'a, Ext: ExtensionLookup<'a, T> + 'a> 
 
 impl GlyphClosure for SingleSubst<'_> {
     fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx<'_>) -> Result<(), ReadError> {
-        for (target, replacement) in self.iter_subs()? {
-            if ctx.current_glyphs().contains(target) {
-                ctx.add_glyph(replacement);
-            }
+        match self {
+            SingleSubst::Format1(t) => t.add_reachable_glyphs(ctx),
+            SingleSubst::Format2(t) => t.add_reachable_glyphs(ctx),
+        }
+    }
+}
+
+impl GlyphClosure for SingleSubstFormat1<'_> {
+    fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx) -> Result<(), ReadError> {
+        let coverage = self.coverage()?;
+        let num_glyphs = coverage.population();
+        let mask = u16::MAX;
+        // ref: https://github.com/harfbuzz/harfbuzz/blob/fbf5b2aa035d6cd9b796d74252045e2b7156ad02/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L55
+        if num_glyphs >= mask as usize {
+            return Ok(());
+        }
+
+        let intersection = coverage.intersect_set(ctx.parent_active_glyphs());
+        if intersection.is_empty() {
+            return Ok(());
+        }
+
+        // help fuzzer
+        // ref: https://github.com/harfbuzz/harfbuzz/blob/fbf5b2aa035d6cd9b796d74252045e2b7156ad02/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L61
+        let d = self.delta_glyph_id() as i32;
+        let mask = mask as i32;
+        let min_before = intersection.first().unwrap().to_u32() as i32;
+        let max_before = intersection.last().unwrap().to_u32() as i32;
+        let min_after = (min_before + d) & mask;
+        let max_after = (max_before + d) & mask;
+
+        if intersection.len() == (max_before - min_before + 1) as u64
+            && ((min_before <= min_after && min_after <= max_before)
+                || (min_before <= max_after && max_after <= max_before))
+        {
+            return Ok(());
+        }
+
+        for g in intersection.iter() {
+            let new_g = (g.to_u32() as i32 + d) & mask;
+            ctx.add(GlyphId::from(new_g as u32));
         }
         Ok(())
     }
 }
 
-impl SingleSubst<'_> {
-    fn iter_subs(&self) -> Result<impl Iterator<Item = (GlyphId16, GlyphId16)> + '_, ReadError> {
-        let (left, right) = match self {
-            SingleSubst::Format1(t) => (Some(t.iter_subs()?), None),
-            SingleSubst::Format2(t) => (None, Some(t.iter_subs()?)),
+impl GlyphClosure for SingleSubstFormat2<'_> {
+    fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx) -> Result<(), ReadError> {
+        let coverage = self.coverage()?;
+        let glyph_set = ctx.parent_active_glyphs();
+        let subs_glyphs = self.substitute_glyph_ids();
+
+        let new_glyphs: Vec<GlyphId> = if self.glyph_count() as u64 > glyph_set.len() {
+            glyph_set
+                .iter()
+                .filter_map(|g| coverage.get(g))
+                .filter_map(|idx| {
+                    subs_glyphs
+                        .get(idx as usize)
+                        .map(|new_g| GlyphId::from(new_g.get()))
+                })
+                .collect()
+        } else {
+            coverage
+                .iter()
+                .zip(subs_glyphs)
+                .filter(|&(g, _)| glyph_set.contains(GlyphId::from(g)))
+                .map(|(_, &new_g)| GlyphId::from(new_g.get()))
+                .collect()
         };
-        Ok(left
-            .into_iter()
-            .flatten()
-            .chain(right.into_iter().flatten()))
-    }
-}
-
-impl SingleSubstFormat1<'_> {
-    fn iter_subs(&self) -> Result<impl Iterator<Item = (GlyphId16, GlyphId16)> + '_, ReadError> {
-        let delta = self.delta_glyph_id();
-        let coverage = self.coverage()?;
-        Ok(coverage.iter().filter_map(move |gid| {
-            let raw = (gid.to_u16() as i32).checked_add(delta as i32);
-            let raw = raw.and_then(|raw| u16::try_from(raw).ok())?;
-            Some((gid, GlyphId16::new(raw)))
-        }))
-    }
-}
-
-impl SingleSubstFormat2<'_> {
-    fn iter_subs(&self) -> Result<impl Iterator<Item = (GlyphId16, GlyphId16)> + '_, ReadError> {
-        let coverage = self.coverage()?;
-        let subs = self.substitute_glyph_ids();
-        Ok(coverage.iter().zip(subs.iter().map(|id| id.get())))
+        ctx.add_glyph_set(new_glyphs);
+        Ok(())
     }
 }
 
 impl GlyphClosure for MultipleSubstFormat1<'_> {
     fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx<'_>) -> Result<(), ReadError> {
         let coverage = self.coverage()?;
+        let glyph_set = ctx.parent_active_glyphs();
         let sequences = self.sequences();
-        for (gid, replacements) in coverage.iter().zip(sequences.iter()) {
-            let replacements = replacements?;
-            if ctx.current_glyphs().contains(gid) {
-                ctx.extend_glyphs(
-                    replacements
-                        .substitute_glyph_ids()
+
+        let new_glyphs: Vec<GlyphId> = if self.sequence_count() as u64 > glyph_set.len() {
+            glyph_set
+                .iter()
+                .filter_map(|g| coverage.get(g))
+                .filter_map(|idx| sequences.get(idx as usize).ok())
+                .map(|seq| {
+                    seq.substitute_glyph_ids()
                         .iter()
-                        .map(|gid| gid.get()),
-                );
-            }
-        }
+                        .map(|new_g| GlyphId::from(new_g.get()))
+                })
+                .flatten()
+                .collect()
+        } else {
+            coverage
+                .iter()
+                .zip(sequences.iter())
+                .filter_map(|(g, seq)| {
+                    glyph_set
+                        .contains(GlyphId::from(g))
+                        .then(|| seq.ok())
+                        .flatten()
+                })
+                .map(|seq| {
+                    seq.substitute_glyph_ids()
+                        .iter()
+                        .map(|new_g| GlyphId::from(new_g.get()))
+                })
+                .flatten()
+                .collect()
+        };
+
+        ctx.add_glyph_set(new_glyphs);
         Ok(())
     }
 }
@@ -346,13 +425,43 @@ impl GlyphClosure for MultipleSubstFormat1<'_> {
 impl GlyphClosure for AlternateSubstFormat1<'_> {
     fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx<'_>) -> Result<(), ReadError> {
         let coverage = self.coverage()?;
+        let glyph_set = ctx.parent_active_glyphs();
         let alts = self.alternate_sets();
-        for (gid, alts) in coverage.iter().zip(alts.iter()) {
-            let alts = alts?;
-            if ctx.current_glyphs().contains(gid) {
-                ctx.extend_glyphs(alts.alternate_glyph_ids().iter().map(|gid| gid.get()));
-            }
-        }
+
+        let new_glyphs: Vec<GlyphId> = if self.alternate_set_count() as u64 > glyph_set.len() {
+            glyph_set
+                .iter()
+                .filter_map(|g| coverage.get(g))
+                .filter_map(|idx| alts.get(idx as usize).ok())
+                .map(|alt_set| {
+                    alt_set
+                        .alternate_glyph_ids()
+                        .iter()
+                        .map(|new_g| GlyphId::from(new_g.get()))
+                })
+                .flatten()
+                .collect()
+        } else {
+            coverage
+                .iter()
+                .zip(alts.iter())
+                .filter_map(|(g, alt_set)| {
+                    glyph_set
+                        .contains(GlyphId::from(g))
+                        .then(|| alt_set.ok())
+                        .flatten()
+                })
+                .map(|alt_set| {
+                    alt_set
+                        .alternate_glyph_ids()
+                        .iter()
+                        .map(|new_g| GlyphId::from(new_g.get()))
+                })
+                .flatten()
+                .collect()
+        };
+
+        ctx.add_glyph_set(new_glyphs);
         Ok(())
     }
 }
@@ -361,18 +470,31 @@ impl GlyphClosure for LigatureSubstFormat1<'_> {
     fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx<'_>) -> Result<(), ReadError> {
         let coverage = self.coverage()?;
         let ligs = self.ligature_sets();
-        for (gid, lig_set) in coverage.iter().zip(ligs.iter()) {
-            let lig_set = lig_set?;
-            if ctx.current_glyphs().contains(gid) {
-                for lig in lig_set.ligatures().iter() {
-                    let lig = lig?;
-                    if lig
-                        .component_glyph_ids()
-                        .iter()
-                        .all(|gid| ctx.glyphs().contains(gid.get()))
-                    {
-                        ctx.add_glyph(lig.ligature_glyph());
-                    }
+        let lig_set_idxes: Vec<usize> =
+            if self.ligature_set_count() as u64 > ctx.parent_active_glyphs().len() {
+                ctx.parent_active_glyphs()
+                    .iter()
+                    .filter_map(|g| coverage.get(g))
+                    .map(|idx| idx as usize)
+                    .collect()
+            } else {
+                coverage
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, g)| {
+                        ctx.parent_active_glyphs()
+                            .contains(GlyphId::from(g))
+                            .then(|| idx)
+                    })
+                    .collect()
+            };
+
+        for idx in lig_set_idxes {
+            let lig_set = ligs.get(idx)?;
+            for lig in lig_set.ligatures().iter() {
+                let lig = lig?;
+                if lig.intersects(ctx.glyphs())? {
+                    ctx.add(GlyphId::from(lig.ligature_glyph()));
                 }
             }
         }
@@ -382,20 +504,32 @@ impl GlyphClosure for LigatureSubstFormat1<'_> {
 
 impl GlyphClosure for ReverseChainSingleSubstFormat1<'_> {
     fn add_reachable_glyphs(&self, ctx: &mut ClosureCtx<'_>) -> Result<(), ReadError> {
-        for coverage in self
-            .backtrack_coverages()
-            .iter()
-            .chain(self.lookahead_coverages().iter())
-        {
-            if !coverage?.iter().any(|gid| ctx.glyphs().contains(gid)) {
-                return Ok(());
-            }
+        if !self.intersects(ctx.glyphs())? {
+            return Ok(());
         }
 
-        for (gid, sub) in self.coverage()?.iter().zip(self.substitute_glyph_ids()) {
-            if ctx.current_glyphs().contains(gid) {
-                ctx.add_glyph(sub.get());
-            }
+        let coverage = self.coverage()?;
+        let glyph_set = ctx.parent_active_glyphs();
+        let idxes: Vec<usize> = if self.glyph_count() as u64 > glyph_set.len() {
+            glyph_set
+                .iter()
+                .filter_map(|g| coverage.get(g))
+                .map(|idx| idx as usize)
+                .collect()
+        } else {
+            coverage
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, g)| glyph_set.contains(GlyphId::from(g)).then(|| idx))
+                .collect()
+        };
+
+        let sub_glyphs = self.substitute_glyph_ids();
+        for i in idxes {
+            let Some(g) = sub_glyphs.get(i) else {
+                continue;
+            };
+            ctx.add(GlyphId::from(g.get()));
         }
 
         Ok(())
